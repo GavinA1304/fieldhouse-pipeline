@@ -1,0 +1,69 @@
+name: live-sync
+# Every 15 minutes, all year. This repo is public (code only: no data, no
+# config, no models), so GitHub Actions minutes are unlimited. A 5-second
+# pre-check skips the R setup when nothing is new.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# Live runs queue behind each other (a newer pending one replaces an older
+# one, which is fine). Heavy jobs use their own group and the gate below.
+concurrency:
+  group: hf-live
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45          # a busy college Saturday can mean many sessions
+    env:
+      HF_REPO: ${{ vars.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      TRACKMAN_CLIENT_ID: ${{ secrets.TRACKMAN_CLIENT_ID }}
+      TRACKMAN_CLIENT_SECRET: ${{ secrets.TRACKMAN_CLIENT_SECRET }}
+      TRACKMAN_FTP_USER: ${{ secrets.TRACKMAN_FTP_USER }}
+      TRACKMAN_FTP_PASSWORD: ${{ secrets.TRACKMAN_FTP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      # Heavy jobs (nightly/backfill) rewrite season files; a live
+      # run during one would just collide, so it steps aside.
+      - name: Skip if a heavy job is running
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          busy=0
+          for wf in nightly.yml backfill.yml; do
+            for st in in_progress queued; do
+              n=$(gh run list --repo "${{ github.repository }}" --workflow "$wf" --status "$st" --json databaseId -q length 2>/dev/null || echo 0)
+              busy=$((busy + n))
+            done
+          done
+          echo "skip=$([ $busy -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          [ $busy -gt 0 ] && echo "::notice::Heavy job running; skipping this live run." || true
+      - name: Anything new? (5-second check, no R needed)
+        id: check
+        if: steps.gate.outputs.skip != 'true'
+        run: python3 scripts/live_check.py
+      - uses: ./.github/actions/sync
+        if: steps.gate.outputs.skip != 'true' && steps.check.outputs.new == 'true'
+        with:
+          args: --mode live
+          retries: "0"
+      # New data landed: wake the private repo to score it with your models.
+      # Its concurrency setting collapses bursts into one run at a time.
+      - name: Wake the private scorer
+        if: steps.check.outputs.new == 'true' && hashFiles('build/new_data.txt') != ''
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}
+        run: gh api "repos/${{ vars.PRIVATE_REPO }}/dispatches" -f event_type=new-data --silent && echo "scorer notified"
+      - if: failure()
+        uses: ./.github/actions/notify
+        with:
+          outcome: failure

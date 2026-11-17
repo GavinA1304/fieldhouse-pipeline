@@ -1,0 +1,72 @@
+name: nightly-sync
+# Every night: re-check the lookback window (unverified -> verified), pull
+# TruMedia, merge the day's deltas into sorted season files, rebuild
+# summaries/dropdowns, and run the stale-data health check.
+on:
+  schedule:
+    - cron: "43 8 * * *"        # 08:43 UTC = 3:43/4:43 AM Eastern
+  workflow_dispatch:
+
+concurrency:
+  group: hf-heavy
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # keepalive commit
+  issues: write
+  actions: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_REPO: ${{ vars.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      TRACKMAN_CLIENT_ID: ${{ secrets.TRACKMAN_CLIENT_ID }}
+      TRACKMAN_CLIENT_SECRET: ${{ secrets.TRACKMAN_CLIENT_SECRET }}
+      TRACKMAN_FTP_USER: ${{ secrets.TRACKMAN_FTP_USER }}
+      TRACKMAN_FTP_PASSWORD: ${{ secrets.TRACKMAN_FTP_PASSWORD }}
+      TRUMEDIA_USERNAME: ${{ secrets.TRUMEDIA_USERNAME }}
+      TRUMEDIA_SITENAME: ${{ secrets.TRUMEDIA_SITENAME }}
+      TRUMEDIA_MASTER_TOKEN: ${{ secrets.TRUMEDIA_MASTER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      # Let any in-flight live run finish first (live runs skip while we work).
+      - name: Wait for live run to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 60); do
+            n=$(gh run list --repo "${{ github.repository }}" --workflow live.yml --status in_progress --json databaseId -q length 2>/dev/null || echo 0)
+            [ "$n" = "0" ] && exit 0
+            sleep 30
+          done
+      - uses: ./.github/actions/sync
+        with:
+          retries: "2"
+          args: --mode nightly
+
+      - name: Wake the private scorer
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}
+        run: gh api "repos/${{ vars.PRIVATE_REPO }}/dispatches" -f event_type=nightly-done --silent && echo "scorer notified"
+      - uses: ./.github/actions/notify
+        if: always()
+        with:
+          outcome: ${{ job.status }}
+
+      # GitHub switches off scheduled workflows after 60 days without repo
+      # activity (it would go dark over the offseason). An empty commit
+      # every ~45 days prevents that.
+      - name: Keepalive
+        if: always()
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
+            git config user.name "fieldhouse-bot"
+            git config user.email "fieldhouse-bot@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi

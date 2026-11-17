@@ -1,0 +1,30 @@
+name: fieldhouse-notify
+description: Open/update one GitHub issue on failure (GitHub emails you), close it on recovery.
+inputs:
+  outcome:
+    description: success or failure
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        WORKFLOW: ${{ github.workflow }}
+      run: |
+        open=$(gh issue list --repo "$REPO" --state open --label pipeline-failure --json number -q '.[0].number' 2>/dev/null || true)
+        if [ "${{ inputs.outcome }}" = "failure" ]; then
+          # Issues on a public repo are public: no details here, just the link.
+          body=$(printf '**%s** failed or found stale data.\n\nOpen the run log for the (redacted) reason: %s' "$WORKFLOW" "$RUN_URL")
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --repo "$REPO" --body "$body"
+          else
+            gh label create pipeline-failure --repo "$REPO" --color B60205 2>/dev/null || true
+            gh issue create --repo "$REPO" --label pipeline-failure \
+              --title "Data pipeline needs attention" --body "$body"
+          fi
+        elif [ -n "$open" ]; then
+          gh issue close "$open" --repo "$REPO" --comment "Recovered: $WORKFLOW succeeded ($RUN_URL)."
+        fi

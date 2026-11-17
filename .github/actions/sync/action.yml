@@ -1,0 +1,62 @@
+name: fieldhouse-sync
+description: Set up R (cached), run the pipeline, upload, report health.
+inputs:
+  args:
+    description: Arguments for run.R
+    required: true
+  retries:
+    description: Re-run this many times if another job wrote to the dataset meanwhile (0 = just skip)
+    default: "0"
+runs:
+  using: composite
+  steps:
+    - uses: r-lib/actions/setup-r@v2
+      with:
+        use-public-rspm: true        # prebuilt Linux binaries: installs in seconds, not minutes
+
+    - uses: r-lib/actions/setup-r-dependencies@v2
+      with:
+        cache-version: 1             # bump to force a clean package reinstall
+        packages: |
+          any::httr2
+          any::jsonlite
+          any::DBI
+          any::duckdb
+          any::yaml
+          any::curl
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install uploader
+      shell: bash
+      run: pip install --quiet "huggingface_hub>=0.25"
+
+    - name: Run pipeline and upload (single atomic commit)
+      shell: bash
+      run: |
+        attempt=0
+        while true; do
+          Rscript run.R ${{ inputs.args }}
+          set +e; python scripts/hf_upload.py; code=$?; set -e
+          if [ $code -eq 0 ]; then break; fi
+          if [ $code -ne 3 ]; then exit $code; fi
+          if [ $attempt -ge ${{ inputs.retries }} ]; then
+            echo "::notice::Another job updated the dataset first; skipping. The next run picks this up."
+            break
+          fi
+          attempt=$((attempt + 1)); echo "Dataset changed underneath us; re-running (attempt $attempt)"
+        done
+
+    - name: Fail loudly on partial errors or stale data
+      shell: bash
+      run: |
+        status=0
+        if [ -f build/errors.txt ]; then
+          echo "::error::Some sources failed (the rest was uploaded):"; cat build/errors.txt; status=1
+        fi
+        if [ -f build/health_problems.txt ]; then
+          echo "::error::Health check:"; cat build/health_problems.txt; status=1
+        fi
+        exit $status

@@ -1,0 +1,21 @@
+# Data never goes in this public repo. These patterns block the common formats.
+build/
+*.parquet
+*.csv
+*.tsv
+*.rds
+*.RData
+*.feather
+*.arrow
+*.xlsx
+*.xls
+*.json.gz
+*.zip
+# credentials
+.Renviron
+.env
+*.pem
+# misc
+.Rhistory
+.Rproj.user/
+__pycache__/

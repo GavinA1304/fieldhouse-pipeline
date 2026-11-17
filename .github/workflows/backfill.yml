@@ -1,0 +1,68 @@
+name: backfill
+# Manual: pull a date range from TrackMan (e.g. to fill a gap) then compact.
+# Keep ranges to about a season or less per run.
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: Start date (YYYY-MM-DD)
+        required: true
+      until:
+        description: End date (YYYY-MM-DD), blank = today
+        required: false
+      force:
+        description: Re-pull sessions already loaded
+        type: boolean
+        default: false
+
+concurrency:
+  group: hf-heavy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      HF_REPO: ${{ vars.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      TRACKMAN_CLIENT_ID: ${{ secrets.TRACKMAN_CLIENT_ID }}
+      TRACKMAN_CLIENT_SECRET: ${{ secrets.TRACKMAN_CLIENT_SECRET }}
+      TRACKMAN_FTP_USER: ${{ secrets.TRACKMAN_FTP_USER }}
+      TRACKMAN_FTP_PASSWORD: ${{ secrets.TRACKMAN_FTP_PASSWORD }}
+      TRUMEDIA_USERNAME: ${{ secrets.TRUMEDIA_USERNAME }}
+      TRUMEDIA_SITENAME: ${{ secrets.TRUMEDIA_SITENAME }}
+      TRUMEDIA_MASTER_TOKEN: ${{ secrets.TRUMEDIA_MASTER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      # Let any in-flight live run finish first (live runs skip while we work).
+      - name: Wait for live run to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 60); do
+            n=$(gh run list --repo "${{ github.repository }}" --workflow live.yml --status in_progress --json databaseId -q length 2>/dev/null || echo 0)
+            [ "$n" = "0" ] && exit 0
+            sleep 30
+          done
+      - uses: ./.github/actions/sync
+        with:
+          retries: "2"
+          args: >-
+            --mode backfill --since ${{ inputs.since }}
+            ${{ inputs.until && format('--until {0}', inputs.until) || '' }}
+            ${{ inputs.force && '--force' || '' }}
+      - name: Wake the private scorer
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}
+        run: gh api "repos/${{ vars.PRIVATE_REPO }}/dispatches" -f event_type=new-data --silent && echo "scorer notified"
+      - if: failure()
+        uses: ./.github/actions/notify
+        with:
+          outcome: failure
