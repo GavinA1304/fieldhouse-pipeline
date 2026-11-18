@@ -45,6 +45,49 @@ for (col in intersect(names(VOCAB), cols)) {
                                 paste(sprintf("%s (%d)", vals$v[unknown], vals$n[unknown]), collapse = ", ")))
 }
 
+# ---- What's in this file, so you can decide what Brewster gets -------------
+desc <- dbGetQuery(con, "DESCRIBE src")
+have <- setNames(desc$column_type, desc$column_name)
+show <- function(title, sql) { cat(sprintf("\n%s\n", title)); print(dbGetQuery(con, sql), row.names = FALSE) }
+for (col in intersect(c("Level", "League"), cols)) {
+  show(sprintf("%s values (set include.%s in config.yml to the ones to keep):", col, tolower(paste0(col, "s"))),
+       sprintf("SELECT CAST(%s AS VARCHAR) AS %s, count(*) AS rows FROM src GROUP BY 1 ORDER BY 2 DESC LIMIT 40", sql_id(col), col))
+}
+gd <- if ("Date" %in% cols) date_expr(toupper(have[["Date"]])) else "CAST(NULL AS DATE)"
+show("Rows by month of the year (fall ball / scrimmages usually show up in Sep-Nov):",
+     sprintf("SELECT month(%s) AS month, count(*) AS rows FROM src GROUP BY 1 ORDER BY 1", gd))
+if (all(c("HomeTeam", "AwayTeam") %in% cols)) {
+  show("Same team on both sides (intrasquads, bullpens, practices):",
+       "SELECT count(*) AS rows FROM src WHERE HomeTeam = AwayTeam OR HomeTeam IS NULL OR AwayTeam IS NULL")
+}
+rules <- include_conditions(cfg, have, gd)
+if (length(rules)) {
+  cat("\nRows each include rule removes (a row can fail more than one):\n")
+  for (nm in names(rules)) {
+    n <- dbGetQuery(con, sprintf("SELECT count(*) AS n FROM src WHERE NOT coalesce((%s), false)", rules[[nm]]))$n
+    cat(sprintf("  %-55s %s\n", nm, format(n, big.mark = ",")))
+  }
+} else {
+  cat("\nNo include rules set yet: EVERYTHING in the file would be loaded. Set include: in config.yml.\n")
+}
+# Borderline games to eyeball: teams that barely appear (alumni games,
+# exhibitions vs. pro/JUCO/club teams usually show up here). Add any that
+# aren't real D1-D3 opponents to include.exclude_teams.
+if (length(rules) && all(c("HomeTeam", "AwayTeam") %in% cols)) {
+  keep <- paste(sprintf("coalesce((%s), false)", rules), collapse = " AND ")
+  show("Teams with fewer than 4 game dates in a season (check these; exhibitions hide here):", sprintf("
+    WITH g AS (SELECT DISTINCT year(%s) AS season, %s AS d, HomeTeam AS team FROM src WHERE %s
+               UNION SELECT DISTINCT year(%s), %s, AwayTeam FROM src WHERE %s)
+    SELECT season, team, count(DISTINCT d) AS game_dates FROM g GROUP BY 1, 2
+    HAVING count(DISTINCT d) < 4 ORDER BY 1, 3, 2 LIMIT 200", gd, gd, keep, gd, gd, keep))
+  if ("Date" %in% cols) show("February games (season openers: make sure none are preseason exhibitions):", sprintf("
+    SELECT %s AS date, HomeTeam, AwayTeam, count(*) AS pitches FROM src
+    WHERE %s AND month(%s) = 2 GROUP BY 1, 2, 3 ORDER BY 1 LIMIT 60", gd, keep, gd))
+}
+
+cat(sprintf("\nAll %d columns (list any that must not be shared under include.drop_columns):\n", length(cols)))
+cat(strwrap(paste(cols, collapse = ", "), width = 110, prefix = "  "), sep = "\n")
+
 dbExecute(con, sprintf("CREATE VIEW cleaned AS %s", clean_select_sql(con, "src", cfg)))
 if (all(c("HomeTeam", "AwayTeam") %in% cols)) {
   tc <- dbGetQuery(con, "SELECT t AS team_code, count(*) AS rows FROM
@@ -61,7 +104,8 @@ by_season <- dbGetQuery(con, "
 cat("\nAfter cleaning, by season (from the real game date):\n")
 print(by_season, row.names = FALSE)
 n_clean <- sum(by_season$rows)
-cat(sprintf("\nImpossible rows dropped: %s\n", format(n_src - n_clean, big.mark = ",")))
+cat(sprintf("\nRows NOT loaded (include rules + impossible rows): %s of %s\n",
+            format(n_src - n_clean, big.mark = ","), format(n_src, big.mark = ",")))
 if (any(by_season$season == "unknown")) {
   cat("NOTE: 'unknown' season = rows with no parseable date (check these: often misfiled appearances from other leagues).\n")
 }

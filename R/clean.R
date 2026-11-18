@@ -163,13 +163,72 @@ clean_select_sql <- function(con, relation, cfg) {
   }
   if ("Inning" %in% names(have)) conds <- c(conds, 'coalesce(TRY_CAST("Inning" AS INTEGER), 1) >= 1')
 
+  # 7. what this dataset is allowed to contain (config: include). Applied to
+  #    history AND every live pull, so nothing outside it ever lands.
+  conds <- c(conds, include_conditions(cfg, have, gd))
+
+  # 8. columns that must never be copied over (config: include.drop_columns)
+  drop <- intersect(unlist(cfg$include$drop_columns), names(have))
+  replace <- replace[setdiff(names(replace), drop)]
+
   sel <- "*"
+  if (length(drop)) sel <- sprintf("* EXCLUDE (%s)", paste(sql_id(drop), collapse = ", "))
   if (length(replace)) {
-    sel <- sprintf("* REPLACE (%s)", paste(sprintf("%s AS %s", replace, sql_id(names(replace))), collapse = ",\n  "))
+    sel <- sprintf("%s REPLACE (%s)", sel, paste(sprintf("%s AS %s", replace, sql_id(names(replace))), collapse = ",\n  "))
   }
   if (length(add)) sel <- paste0(sel, ",\n  ", paste(add, collapse = ",\n  "))
   where <- if (length(conds)) paste("WHERE", paste(conds, collapse = " AND ")) else ""
   sprintf("SELECT %s\nFROM %s\n%s", sel, relation, where)
+}
+
+# The "include" rules from config.yml, as SQL conditions. Each rule only
+# applies if its column exists. Returns a named character vector (names are
+# rule labels, used by the seed dry run to report what each rule removes).
+include_conditions <- function(cfg, have, gd) {
+  inc <- cfg$include %||% list()
+  ids <- function(x) paste(sql_str(unlist(x)), collapse = ", ")
+  conds <- character()
+  col <- function(nm) sprintf("trim(CAST(%s AS VARCHAR))", sql_id(nm))
+  if (length(unlist(inc$levels)) && "Level" %in% names(have)) {
+    # Match spelling variants: "D1", "DI", "Division I", "NCAA D1" all count as D1.
+    alias <- list(D1 = c("D1", "DI", "DIVISIONI", "DIVISION1", "NCAAD1", "NCAADI", "NCAADIVISIONI"),
+                  D2 = c("D2", "DII", "DIVISIONII", "DIVISION2", "NCAAD2", "NCAADII", "NCAADIVISIONII"),
+                  D3 = c("D3", "DIII", "DIVISIONIII", "DIVISION3", "NCAAD3", "NCAADIII", "NCAADIVISIONIII"))
+    keys <- unique(unlist(lapply(unlist(inc$levels), function(l) {
+      k <- toupper(gsub("[^A-Za-z0-9]", "", l)); alias[[k]] %||% k })))
+    conds["level not in include.levels"] <- sprintf(
+      "upper(regexp_replace(%s, '[^A-Za-z0-9]', '', 'g')) IN (%s)", col("Level"), ids(keys))
+  }
+  # Exhibitions, scrimmages, fall/preseason games: keyword check across the
+  # columns that describe the game (never pitch-level notes).
+  kw <- unlist(inc$exclude_keywords)
+  kcols <- intersect(c("Level", "League", "HomeTeam", "AwayTeam", "GameID", "Stadium", "GameType", "SessionType"), names(have))
+  if (length(kw) && length(kcols)) {
+    # whole words only, so "camp" never matches Campbell and "fall" never matches Fallon
+    words <- gsub(" ", "[^a-z0-9]?", tolower(gsub("[^A-Za-z0-9 ]", "", kw)), fixed = TRUE)  # "blue white" matches Blue-White too
+    pattern <- paste0("\\b(", paste(words, collapse = "|"), ")\\b")
+    conds["game looks like exhibition/scrimmage/practice (include.exclude_keywords)"] <- sprintf(
+      "NOT regexp_matches(lower(concat_ws(' ', %s)), %s)",
+      paste(sprintf("CAST(%s AS VARCHAR)", sql_id(kcols)), collapse = ", "), sql_str(pattern))
+  }
+  if (length(unlist(inc$leagues)) && "League" %in% names(have))
+    conds["league not in include.leagues"] <- sprintf("%s IN (%s)", col("League"), ids(inc$leagues))
+  if (length(unlist(inc$exclude_leagues)) && "League" %in% names(have))
+    conds["league in include.exclude_leagues"] <- sprintf("coalesce(%s, '') NOT IN (%s)", col("League"), ids(inc$exclude_leagues))
+  if (length(unlist(inc$exclude_teams)) && all(c("HomeTeam", "AwayTeam") %in% names(have)))
+    conds["team in include.exclude_teams"] <- sprintf("coalesce(%s, '') NOT IN (%s) AND coalesce(%s, '') NOT IN (%s)",
+                                                       col("HomeTeam"), ids(inc$exclude_teams), col("AwayTeam"), ids(inc$exclude_teams))
+  if (isTRUE(inc$require_two_teams) && all(c("HomeTeam", "AwayTeam") %in% names(have)))
+    conds["same team both sides (intrasquad/bullpen/practice)"] <- sprintf(
+      "nullif(%s, '') IS NOT NULL AND nullif(%s, '') IS NOT NULL AND %s <> %s",
+      col("HomeTeam"), col("AwayTeam"), col("HomeTeam"), col("AwayTeam"))
+  if (isTRUE(inc$require_date))
+    conds["no usable game date"] <- sprintf("(%s) IS NOT NULL", gd)
+  if (length(unlist(inc$months)))
+    conds["outside include.months"] <- sprintf("month(%s) IN (%s)", gd, paste(as.integer(unlist(inc$months)), collapse = ", "))
+  if (isTRUE(inc$exclude_practice) && "Source" %in% names(have))
+    conds["practice session"] <- "coalesce(CAST(\"Source\" AS VARCHAR), '') NOT LIKE '%practice%'"
+  conds
 }
 
 # Clean an in-memory data.frame and write it as one Parquet file.
