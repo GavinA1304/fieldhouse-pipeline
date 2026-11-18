@@ -80,7 +80,7 @@ summary_sql <- list(
       round(avg((PitchCall IN ('StrikeCalled','StrikeSwinging'))::INT), 3) AS CSWPct,
       round(avg(CASE WHEN PitchCall = 'InPlay' THEN ExitSpeed END), 1) AS EVAllowed
     FROM pitches WHERE Pitcher IS NOT NULL
-    GROUP BY ALL", PTYPE, SWING, INZONE, SWING, INZONE, INZONE),
+    GROUP BY 1, 2, 3, 4, 5, 6", PTYPE, SWING, INZONE, SWING, INZONE, INZONE),
 
   pitcher_season = sprintf("
     SELECT Season, Pitcher, PitcherId, PitcherTeam, PitcherThrows,
@@ -98,7 +98,7 @@ summary_sql <- list(
       round(avg(CASE WHEN PitchCall = 'InPlay' THEN (TaggedHitType = 'GroundBall')::INT END), 3) AS GBPct,
       max(GameDate) AS LastGame
     FROM pitches WHERE Pitcher IS NOT NULL
-    GROUP BY ALL", PA_END, PA_END, PA_END, SWING, SWING, INZONE, INZONE, INZONE, PTYPE),
+    GROUP BY 1, 2, 3, 4, 5", PA_END, PA_END, PA_END, SWING, SWING, INZONE, INZONE, INZONE, PTYPE),
 
   batter_season = sprintf("
     SELECT Season, Batter, BatterId, BatterTeam, BatterSide,
@@ -122,18 +122,18 @@ summary_sql <- list(
       round(sum(((%s) AND NOT (%s))::INT) / nullif(sum((NOT (%s))::INT), 0), 3) AS ChasePct,
       max(GameDate) AS LastGame
     FROM pitches WHERE Batter IS NOT NULL
-    GROUP BY ALL", PA_END, HIT, HIT, PA_END, TB, PA_END, PA_END, PA_END, SWING, SWING, INZONE, INZONE)
+    GROUP BY 1, 2, 3, 4, 5", PA_END, HIT, HIT, PA_END, TB, PA_END, PA_END, PA_END, SWING, SWING, INZONE, INZONE)
 )
 
 # Everything the app's dropdowns need, precomputed - the fix for slow
 # SELECT DISTINCT, but rebuilt automatically instead of hardcoded.
 lookup_sql <- "
   SELECT Season, 'Pitcher' AS Role, Pitcher AS Name, PitcherId AS Id, PitcherTeam AS Team, count(*) AS Pitches
-    FROM pitches WHERE Pitcher IS NOT NULL GROUP BY ALL
+    FROM pitches WHERE Pitcher IS NOT NULL GROUP BY 1, 2, 3, 4, 5
   UNION ALL
-  SELECT Season, 'Batter', Batter, BatterId, BatterTeam, count(*) FROM pitches WHERE Batter IS NOT NULL GROUP BY ALL
+  SELECT Season, 'Batter', Batter, BatterId, BatterTeam, count(*) FROM pitches WHERE Batter IS NOT NULL GROUP BY 1, 2, 3, 4, 5
   UNION ALL
-  SELECT Season, 'Catcher', Catcher, CatcherId, CatcherTeam, count(*) FROM pitches WHERE Catcher IS NOT NULL GROUP BY ALL"
+  SELECT Season, 'Catcher', Catcher, CatcherId, CatcherTeam, count(*) FROM pitches WHERE Catcher IS NOT NULL GROUP BY 1, 2, 3, 4, 5"
 
 build_season_outputs <- function(con, season, pitches_file, cfg = NULL, coll = "trackman") {
   # Bullpen/practice rows live in the same files (Source = trackman_api_practice)
