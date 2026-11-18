@@ -40,7 +40,7 @@ redact <- function(msg) {
 }
 
 env <- function(name, required = TRUE) {
-  v <- Sys.getenv(name)
+  v <- trimws(Sys.getenv(name))   # tolerate a stray space/newline pasted into a secret
   if (required && !nzchar(v)) stop("Missing environment variable ", name, call. = FALSE)
   if (grepl("TOKEN|SECRET|PASSWORD", name)) mask_secret(v)
   v
@@ -194,4 +194,23 @@ duck_connect <- function() {
   dbExecute(con, sprintf("SET temp_directory = %s", sql_str(tmp)))
   dbExecute(con, "SET preserve_insertion_order = false")
   con
+}
+
+# ---- Conferences (team code -> conference), from config/team_conferences.csv
+# in the private dataset (columns: team_name, conference). New games get
+# PitcherConference / BatterConference at load time, like the old sync did.
+load_conferences <- function(hub, here = getwd()) {
+  local <- file.path(here, "team_conferences.csv")
+  path <- if (file.exists(local)) local else if ("config/team_conferences.csv" %in% hub_list(hub)) hub_download(hub, "config/team_conferences.csv") else NA
+  if (is.na(path)) return(NULL)
+  t <- utils::read.csv(path, colClasses = "character")
+  setNames(t$conference, gsub("[^a-z0-9]", "", tolower(trimws(t$team_name))))
+}
+add_conferences <- function(df, conf) {
+  if (is.null(conf)) return(df)
+  look <- function(x) { out <- unname(conf[gsub("[^a-z0-9]", "", tolower(trimws(x)))])
+                        out[is.na(out) & !is.na(x) & nzchar(x)] <- "Other / Unmapped"; out }
+  if ("PitcherTeam" %in% names(df) && !"PitcherConference" %in% names(df)) df$PitcherConference <- look(df$PitcherTeam)
+  if ("BatterTeam" %in% names(df) && !"BatterConference" %in% names(df)) df$BatterConference <- look(df$BatterTeam)
+  df
 }

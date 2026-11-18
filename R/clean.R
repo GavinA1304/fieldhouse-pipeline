@@ -23,7 +23,8 @@ CORE_SCHEMA <- c(
   VertApprAngle = "DOUBLE", HorzApprAngle = "DOUBLE", ZoneTime = "DOUBLE",
   ExitSpeed = "DOUBLE", Angle = "DOUBLE", Direction = "DOUBLE", Distance = "DOUBLE",
   Bearing = "DOUBLE", HangTime = "DOUBLE",
-  Verified = "BOOLEAN", Source = "VARCHAR", PulledAtUtc = "TIMESTAMP"
+  Verified = "BOOLEAN", Source = "VARCHAR", PulledAtUtc = "TIMESTAMP",
+  SourceFile = "VARCHAR", PitcherConference = "VARCHAR", BatterConference = "VARCHAR"
 )
 
 # Non-core columns that look like measurements are cast to DOUBLE; IDs and
@@ -61,7 +62,8 @@ cast_frame <- function(df) {
 # "Home Run", "homerun", "HOMERUN" all become "HomeRun".
 VOCAB <- list(
   PitchCall = c("BallCalled", "BallinDirt", "BallIntentional", "StrikeCalled", "StrikeSwinging",
-                "FoulBall", "FoulBallNotFieldable", "FoulBallFieldable", "InPlay", "HitByPitch", "Undefined"),
+                "FoulBall", "FoulBallNotFieldable", "FoulBallFieldable", "InPlay", "HitByPitch", "Undefined",
+                "CatchersInterference", "BattersInterference", "AutomaticStrike", "AutomaticBall"),
   PlayResult = c("Single", "Double", "Triple", "HomeRun", "Out", "Error", "FieldersChoice",
                  "Sacrifice", "StolenBase", "CaughtStealing", "Undefined"),
   TaggedHitType = c("GroundBall", "LineDrive", "FlyBall", "Popup", "Bunt", "Undefined"),
@@ -218,6 +220,21 @@ include_conditions <- function(cfg, have, gd) {
   if (length(unlist(inc$exclude_teams)) && all(c("HomeTeam", "AwayTeam") %in% names(have)))
     conds["team in include.exclude_teams"] <- sprintf("coalesce(%s, '') NOT IN (%s) AND coalesce(%s, '') NOT IN (%s)",
                                                        col("HomeTeam"), ids(inc$exclude_teams), col("AwayTeam"), ids(inc$exclude_teams))
+  pats <- unlist(inc$exclude_team_patterns)
+  if (length(pats) && all(c("HomeTeam", "AwayTeam") %in% names(have))) {
+    rx <- sql_str(paste0("(?i)(", paste(pats, collapse = "|"), ")"))
+    conds["team code matches include.exclude_team_patterns"] <- sprintf(
+      "NOT regexp_matches(coalesce(%s, ''), %s) AND NOT regexp_matches(coalesce(%s, ''), %s)",
+      col("HomeTeam"), rx, col("AwayTeam"), rx)
+  }
+  # D1 games before that season's official opening day are scrimmages/exhibitions.
+  od <- inc$d1_opening_day
+  if (length(od) && "Level" %in% names(have)) {
+    cases <- paste(sprintf("WHEN %d THEN DATE %s", as.integer(names(od)), sql_str(unlist(od))), collapse = " ")
+    d1 <- sprintf("upper(regexp_replace(%s, '[^A-Za-z0-9]', '', 'g')) IN ('D1','DI','DIVISIONI','DIVISION1','NCAAD1','NCAADI','NCAADIVISIONI')", col("Level"))
+    conds["D1 game before opening day (include.d1_opening_day)"] <- sprintf(
+      "NOT coalesce(%s AND (%s) < (CASE year(%s) %s END), false)", d1, gd, gd, cases)
+  }
   if (isTRUE(inc$require_two_teams) && all(c("HomeTeam", "AwayTeam") %in% names(have)))
     conds["same team both sides (intrasquad/bullpen/practice)"] <- sprintf(
       "nullif(%s, '') IS NOT NULL AND nullif(%s, '') IS NOT NULL AND %s <> %s",

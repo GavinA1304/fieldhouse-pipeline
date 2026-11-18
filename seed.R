@@ -6,6 +6,11 @@
 #   Rscript seed.R path/to/history.parquet --apply    # writes build/out, then run:
 #   python scripts/hf_upload.py
 #
+#   Rscript seed.R ccbl_2026_master.parquet --collection=ccbl [--apply]
+#     loads into a SEPARATE collection (Cape League), never mixed with the
+#     college sheet. Uses collections.ccbl.include from config.yml instead of
+#     the college include rules, and only replaces that collection's seasons.
+#
 # Needs HF_REPO and HF_TOKEN env vars (to merge with the existing manifest).
 # Models aren't run here: the private scoring job scores seeded seasons
 # automatically, a couple per night (config: models.rescore_seasons_per_night).
@@ -14,13 +19,24 @@
 args <- commandArgs(TRUE)
 SRC <- args[!startsWith(args, "--")][1]
 APPLY <- "--apply" %in% args
-if (is.na(SRC) || !file.exists(SRC)) stop("usage: Rscript seed.R path/to/history.parquet [--apply]")
+COLL <- sub("^--collection=", "", grep("^--collection=", args, value = TRUE)[1])
+if (is.na(COLL) || !nzchar(COLL)) COLL <- "trackman"
+if (!grepl("^[a-z0-9_]+$", COLL)) stop("--collection must be lowercase letters/numbers, e.g. ccbl")
+if (is.na(SRC) || !file.exists(SRC)) stop("usage: Rscript seed.R path/to/history.parquet [--collection=ccbl] [--apply]")
 Sys.setenv(TZ = "UTC")
 file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
 HERE <- if (length(file_arg)) dirname(normalizePath(sub("^--file=", "", file_arg))) else getwd()
 for (f in c("utils.R", "clean.R", "build.R")) source(file.path(HERE, "R", f))
 hub <- Hub(env("HF_REPO"), env("HF_TOKEN"))
 cfg <- load_config(hub, HERE)   # local config.yml if present, else config/config.yml in the dataset
+if (COLL != "trackman") {
+  # A separate collection gets its own include rules (no college level/month
+  # filters). Missing block -> sensible defaults for a summer league.
+  cfg$include <- cfg$collections[[COLL]]$include %||%
+    list(require_two_teams = TRUE, require_date = TRUE, exclude_practice = TRUE,
+         drop_columns = cfg$include$drop_columns)
+  log_msg("collection: %s (separate from the college data)", COLL)
+}
 
 con <- duck_connect()
 dbExecute(con, sprintf("CREATE VIEW src AS SELECT * FROM read_parquet(%s, union_by_name = true)", sql_str(SRC)))
@@ -75,14 +91,51 @@ if (length(rules)) {
 # aren't real D1-D3 opponents to include.exclude_teams.
 if (length(rules) && all(c("HomeTeam", "AwayTeam") %in% cols)) {
   keep <- paste(sprintf("coalesce((%s), false)", rules), collapse = " AND ")
-  show("Teams with fewer than 4 game dates in a season (check these; exhibitions hide here):", sprintf("
-    WITH g AS (SELECT DISTINCT year(%s) AS season, %s AS d, HomeTeam AS team FROM src WHERE %s
-               UNION SELECT DISTINCT year(%s), %s, AwayTeam FROM src WHERE %s)
-    SELECT season, team, count(DISTINCT d) AS game_dates FROM g GROUP BY 1, 2
-    HAVING count(DISTINCT d) < 4 ORDER BY 1, 3, 2 LIMIT 200", gd, gd, keep, gd, gd, keep))
-  if ("Date" %in% cols) show("February games (season openers: make sure none are preseason exhibitions):", sprintf("
-    SELECT %s AS date, HomeTeam, AwayTeam, count(*) AS pitches FROM src
-    WHERE %s AND month(%s) = 2 GROUP BY 1, 2, 3 ORDER BY 1 LIMIT 60", gd, keep, gd))
+  show("Team codes that look like practice/exhibition/national teams (check; add to exclude_teams):", sprintf("
+    WITH t AS (SELECT HomeTeam AS team FROM src WHERE %s UNION ALL SELECT AwayTeam FROM src WHERE %s)
+    SELECT team, count(*) AS pitches FROM t
+    WHERE regexp_matches(team, '(?i)(PRA|PRAC|SCR|EXH|ALU|WBC|NAT|TEAM|USA|BLU|RED|WHI|GRAY|GREY)$')
+       OR regexp_matches(team, '(?i)(WBC|_US$|^USA|ALUM|SCRIM)')
+    GROUP BY 1 ORDER BY 2 DESC LIMIT 100", keep, keep))
+  show("Teams that appear on only ONE date in the whole file (one-off opponents; most are real schools):", sprintf("
+    WITH g AS (SELECT DISTINCT %s AS d, HomeTeam AS team, Level FROM src WHERE %s
+               UNION SELECT DISTINCT %s, AwayTeam, Level FROM src WHERE %s)
+    SELECT team, min(d) AS date, any_value(Level) AS level FROM g GROUP BY 1
+    HAVING count(DISTINCT d) = 1 ORDER BY 2 LIMIT 400", gd, keep, gd, keep))
+  if ("Date" %in% cols) show("Earliest games kept each season (should start on/after opening day for D1):", sprintf("
+    SELECT year(%s) AS season, Level, min(%s) AS first_date, count(DISTINCT %s) FILTER (WHERE month(%s) = 2) AS feb_game_dates
+    FROM src WHERE %s GROUP BY 1, 2 ORDER BY 1, 2", gd, gd, gd, gd, keep))
+}
+
+# ---- Does it have everything? ---------------------------------------------
+key_cols <- c("Date", "PitchUID", "GameUID", "HomeTeam", "AwayTeam", "Level", "League",
+              "Pitcher", "PitcherId", "PitcherThrows", "PitcherTeam", "Batter", "BatterId", "BatterSide", "BatterTeam",
+              "Inning", "Balls", "Strikes", "Outs", "TaggedPitchType", "AutoPitchType", "PitchCall", "KorBB",
+              "PlayResult", "TaggedHitType", "RelSpeed", "SpinRate", "SpinAxis", "InducedVertBreak", "HorzBreak",
+              "RelHeight", "RelSide", "Extension", "VertApprAngle", "PlateLocHeight", "PlateLocSide",
+              "ExitSpeed", "Angle", "Direction", "Distance")
+cat("\nKey columns the app uses (present? and % of rows filled in):\n")
+fill <- vapply(key_cols, function(k) {
+  if (!(k %in% cols)) return("MISSING")
+  pct <- dbGetQuery(con, sprintf("SELECT round(100.0 * count(%s) / count(*), 1) AS p FROM src", sql_id(k)))$p
+  sprintf("%5.1f%%", pct)
+}, "")
+cat(sprintf("  %-18s %s", names(fill), fill), sep = "\n")
+if (any(fill == "MISSING")) cat("  -> MISSING columns will be empty in the app.\n")
+cat("  (Hit columns like ExitSpeed/Angle are only filled on balls in play, so ~15-20% is normal.)\n")
+
+if (length(rules)) {
+  keep <- paste(sprintf("coalesce((%s), false)", rules), collapse = " AND ")
+  show("After the filter: game dates per month in each season (gaps = missing data):", sprintf("
+    PIVOT (SELECT year(%s) AS season, month(%s) AS m, %s AS d FROM src WHERE %s)
+    ON m USING count(DISTINCT d) GROUP BY season ORDER BY season", gd, gd, gd, keep))
+  show("After the filter: most recent games in the file:", sprintf("
+    SELECT %s AS date, count(DISTINCT HomeTeam || AwayTeam) AS games, count(*) AS pitches
+    FROM src WHERE %s GROUP BY 1 ORDER BY 1 DESC LIMIT 10", gd, keep))
+  show("After the filter: teams per season (D1 alone is ~300):", sprintf("
+    SELECT year(%s) AS season, count(DISTINCT HomeTeam) AS home_teams, count(DISTINCT Pitcher) AS pitchers,
+           count(DISTINCT Batter) AS batters, count(*) AS pitches
+    FROM src WHERE %s GROUP BY 1 ORDER BY 1", gd, keep))
 }
 
 cat(sprintf("\nAll %d columns (list any that must not be shared under include.drop_columns):\n", length(cols)))
@@ -115,13 +168,15 @@ dir.create(WORK, recursive = TRUE, showWarnings = FALSE)
 writeLines(hub_sha(hub), file.path(WORK, "base_sha.txt"))
 manifest <- hub_read_json(hub, "manifest.json", list(version = 1))
 empty_obj <- function() setNames(list(), character())
-for (k in c("trackman", "summary", "trumedia")) if (!length(manifest[[k]])) manifest[[k]] <- empty_obj()
+SK <- summary_key(COLL)
+for (k in c("trackman", "summary", "trumedia", COLL, SK)) if (!length(manifest[[k]])) manifest[[k]] <- empty_obj()
+manifest <- register_collection(register_collection(manifest, "trackman", cfg), COLL, cfg)
 unlink(OUT, recursive = TRUE)
 
 for (i in seq_len(nrow(by_season))) {
   s <- by_season$season[i]
-  if (!is.null(manifest$trackman[[s]]$pitches)) log_msg("WARNING: season %s already exists on the hub and will be replaced", s)
-  out_file <- file.path(OUT, season_path(s))
+  if (!is.null(manifest[[COLL]][[s]]$pitches)) log_msg("WARNING: %s season %s already exists on the hub and will be replaced", COLL, s)
+  out_file <- file.path(OUT, season_path(s, COLL))
   where <- if (s == "unknown") "Season IS NULL" else sprintf("Season = %s", s)
   dbExecute(con, sprintf(
     "COPY (SELECT * REPLACE (coalesce(Source, 'history_seed') AS Source) FROM cleaned WHERE %s
@@ -130,21 +185,21 @@ for (i in seq_len(nrow(by_season))) {
     where, sql_str(ensure_dir(out_file)), as.integer(cfg$build$row_group_size)))
   rows <- dbGetQuery(con, sprintf("SELECT count(*) n FROM read_parquet(%s)", sql_str(out_file)))$n
   if (rows != by_season$rows[i]) stop(sprintf("Row check failed for %s: expected %d, wrote %d", s, by_season$rows[i], rows))
-  built <- build_season_outputs(con, s, out_file, cfg)
-  manifest$trackman[[s]] <- list(pitches = season_path(s), rows = rows,
-                                 deltas = manifest$trackman[[s]]$deltas %||% list(),
+  built <- build_season_outputs(con, s, out_file, cfg, COLL)
+  manifest[[COLL]][[s]] <- list(pitches = season_path(s, COLL), rows = rows,
+                                 deltas = manifest[[COLL]][[s]]$deltas %||% list(),
                                  models = setNames(list(), character()),  # scored by the nightly run
                                  last_game = built$last_game, last_our_game = built$last_our_game,
                                  updated_utc = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ"))
   for (nm in names(built$paths)) {
-    cur <- manifest$summary[[nm]] %||% empty_obj()
+    cur <- manifest[[SK]][[nm]] %||% empty_obj()
     cur[[s]] <- built$paths[[nm]]
-    manifest$summary[[nm]] <- cur
+    manifest[[SK]][[nm]] <- cur
   }
   log_msg("season %s: %s rows, %.0f MB", s, format(rows, big.mark = ","), file.size(out_file) / 1e6)
 }
 manifest$updated_utc <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ")
 write_json_file(manifest, file.path(OUT, "manifest.json"))
 writeLines(character(), file.path(WORK, "delete_paths.txt"))
-writeLines("seed historical seasons", file.path(WORK, "commit_message.txt"))
+writeLines(sprintf("seed %s seasons", COLL), file.path(WORK, "commit_message.txt"))
 log_msg("staged in %s. Verify the numbers above, then run: python scripts/hf_upload.py", OUT)

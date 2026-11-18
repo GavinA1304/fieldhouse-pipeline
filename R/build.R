@@ -1,8 +1,23 @@
 # Season compaction, summaries, dropdown lookups, health checks.
 
-season_path  <- function(s) sprintf("trackman/season=%s/pitches.parquet", s)
-delta_dir    <- function(s) sprintf("trackman/delta/season=%s", s)
-summary_path <- function(name, s) sprintf("summary/%s/season=%s.parquet", name, s)
+# Collections keep separate datasets apart: "trackman" = college (the main
+# sheet), "ccbl" = Cape League. Each has its own folders, summaries and
+# manifest keys, so models and leaderboards never mix them.
+season_path  <- function(s, coll = "trackman") sprintf("%s/season=%s/pitches.parquet", coll, s)
+delta_dir    <- function(s, coll = "trackman") sprintf("%s/delta/season=%s", coll, s)
+summary_key  <- function(coll = "trackman") if (coll == "trackman") "summary" else paste0(coll, "_summary")
+summary_path <- function(name, s, coll = "trackman") sprintf("%s/%s/season=%s.parquet", summary_key(coll), name, s)
+
+COLLECTION_LABELS <- list(trackman = "College", ccbl = "Cape League")
+# Registry the app reads to offer the College / Cape League switch.
+register_collection <- function(manifest, coll, cfg = NULL) {
+  reg <- manifest$collections
+  if (!length(reg)) reg <- setNames(list(), character())
+  label <- cfg$collections[[coll]]$label %||% COLLECTION_LABELS[[coll]] %||% coll
+  reg[[coll]] <- list(label = label, summary = summary_key(coll))
+  manifest$collections <- reg
+  manifest
+}
 
 # Merge Parquet files (oldest first) into one sorted, de-duplicated file.
 # Used two ways:
@@ -120,7 +135,7 @@ lookup_sql <- "
   UNION ALL
   SELECT Season, 'Catcher', Catcher, CatcherId, CatcherTeam, count(*) FROM pitches WHERE Catcher IS NOT NULL GROUP BY ALL"
 
-build_season_outputs <- function(con, season, pitches_file, cfg = NULL) {
+build_season_outputs <- function(con, season, pitches_file, cfg = NULL, coll = "trackman") {
   # Bullpen/practice rows live in the same files (Source = trackman_api_practice)
   # but never count toward game stats.
   dbExecute(con, sprintf("CREATE OR REPLACE VIEW pitches AS SELECT * FROM read_parquet(%s)
@@ -136,7 +151,7 @@ build_season_outputs <- function(con, season, pitches_file, cfg = NULL) {
                 batter = if (!is.null(cfg)) avg_cols(model_summary_cols(cfg, "batter")) else "")
   paths <- list()
   for (nm in names(summary_sql)) {
-    p <- summary_path(nm, season)
+    p <- summary_path(nm, season, coll)
     sql <- summary_sql[[nm]]
     who <- if (startsWith(nm, "pitcher")) "pitcher" else "batter"
     anchor <- if (who == "pitcher") "\n    FROM pitches WHERE Pitcher" else "\n    FROM pitches WHERE Batter"
@@ -145,7 +160,7 @@ build_season_outputs <- function(con, season, pitches_file, cfg = NULL) {
                            sql, sql_str(ensure_dir(file.path(OUT, p)))))
     paths[[nm]] <- p
   }
-  p <- summary_path("players", season)
+  p <- summary_path("players", season, coll)
   dbExecute(con, sprintf("COPY (%s) TO %s (FORMAT parquet, COMPRESSION zstd)", lookup_sql,
                          sql_str(ensure_dir(file.path(OUT, p)))))
   paths$players <- p

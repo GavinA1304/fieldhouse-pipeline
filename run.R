@@ -21,7 +21,7 @@ Sys.setenv(TZ = "UTC")
 
 file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
 HERE <- if (length(file_arg)) dirname(normalizePath(sub("^--file=", "", file_arg))) else getwd()
-for (f in c("utils.R", "clean.R", "trackman_api.R", "trackman_ftp.R", "trumedia.R", "build.R")) {
+for (f in c("utils.R", "clean.R", "trackman_api.R", "trackman_ftp.R", "trumedia.R", "trumedia_enrich.R", "build.R")) {
   source(file.path(HERE, "R", f))
 }
 cfg <- NULL  # loaded from the private dataset inside main()
@@ -37,6 +37,7 @@ main <- function() {
   empty_obj <- function() setNames(list(), character())
   manifest <- hub_read_json(hub, "manifest.json", list(version = 1))
   for (k in c("trackman", "summary", "trumedia")) if (!length(manifest[[k]])) manifest[[k]] <- empty_obj()
+  manifest <- register_collection(manifest, "trackman", cfg)
   state <- hub_read_json(hub, "state/trackman.json", list(api = empty_obj(), ftp = empty_obj()))
   for (k in c("api", "ftp")) if (!length(state[[k]])) state[[k]] <- empty_obj()
 
@@ -57,8 +58,10 @@ main <- function() {
   safe_key <- function(x) gsub("[^A-Za-z0-9_.-]", "_", x)
 
   # Clean one batch, then split it into per-season delta files.
+  conf <- load_conferences(hub, HERE)
   ingest <- function(df, key) {
     if (!nrow(df)) return(0)
+    df <- add_conferences(df, conf)
     stage <- file.path(WORK, "stage", paste0(safe_key(key), ".parquet"))
     n <- write_clean_parquet(con, df, stage, cfg)
     if (n[["rows_in"]] != n[["rows_out"]]) log_msg("  dropped %d impossible rows", n[["rows_in"]] - n[["rows_out"]])
@@ -108,17 +111,30 @@ main <- function() {
 
   # ---- TrackMan FTP ------------------------------------------------------------
   if (cfg$trackman$source %in% c("ftp", "both")) {
-    files <- tryCatch(ftp_discover(cfg, FROM, TO), error = function(e) {
-      errors <<- c(errors, paste("FTP listing failed:", redact(conditionMessage(e)))); character()
+    # Deep scan of the whole season's folder tree on every backfill and once a
+    # week at night, to catch files TrackMan filed in odd places.
+    deep_day <- as.integer(cfg$trackman$ftp$deep_scan_weekday %||% 1)   # 1 = Monday
+    deep <- MODE == "backfill" || (MODE == "nightly" && as.integer(format(today, "%u")) == deep_day) || "--deep" %in% args
+    files <- tryCatch(ftp_discover(cfg, FROM, TO, deep, backfill = MODE == "backfill"), error = function(e) {
+      errors <<- c(errors, paste("FTP listing failed:", redact(conditionMessage(e))))
+      data.frame(path = character(), size = numeric(), modified = character())
     })
-    log_msg("FTP CSVs in window: %d", length(files))
-    for (f in files) {
-      if (!FORCE && !is.null(state$ftp[[f]])) next
-      rows <- tryCatch(ingest(ftp_pull_file(cfg, f), paste0("ftp_", tools::file_path_sans_ext(basename(f)))),
-                       error = function(e) { errors <<- c(errors, sprintf("FTP file %d failed: %s", match(f, files), redact(conditionMessage(e)))); NA })
+    games <- ftp_group_games(files)
+    is_new <- function(g) FORCE || any(vapply(seq_len(nrow(g$members)), function(i)
+      ftp_is_new(g$members[i, ], state$ftp[[g$members$path[i]]]), TRUE))
+    todo <- Filter(is_new, games)
+    log_msg("FTP: %d CSVs found (%d games), %d games new or changed", nrow(files), length(games), length(todo))
+    for (i in seq_along(todo)) {
+      g <- todo[[i]]
+      rows <- tryCatch(ingest(ftp_pull_game(cfg, g), paste0("ftp_", gsub("[^A-Za-z0-9]", "_", sub("\\.csv$", "", g$pitch, ignore.case = TRUE)))),
+                       error = function(e) { errors <<- c(errors, sprintf("FTP game %d failed: %s", i, redact(conditionMessage(e)))); NA })
       if (!is.na(rows)) {
-        state$ftp[[f]] <- list(rows = rows, pulled_utc = now_utc())
-        log_msg("  pulled FTP file %d of %d (%d rows)", match(f, files), length(files), rows)
+        for (j in seq_len(nrow(g$members))) {
+          m <- g$members[j, ]
+          state$ftp[[m$path]] <- list(rows = rows, size = m$size, modified = m$modified, pulled_utc = now_utc())
+        }
+        log_msg("  game %d of %d: %d rows kept%s%s", i, length(todo), rows,
+                if (g$verified) ", verified" else ", unverified", if (!is.na(g$fhc)) ", +positioning" else "")
       }
     }
   }
@@ -159,7 +175,10 @@ main <- function() {
     for (s in names(manifest$trackman)) {
       entry <- manifest$trackman[[s]]
       deltas <- unlist(entry$deltas)
-      if (!length(deltas) && !isTRUE(entry$summaries_stale)) next
+      due <- tm_enrich_due(cfg, MODE, s)        # weekly TruMedia fielder fill (TeamPlays)
+      due_p <- tm_pitches_due(cfg, MODE, s)     # nightly TruMedia pitch fill (new games only)
+      if (!length(deltas) && !isTRUE(entry$summaries_stale) && !due && !due_p) next
+      out_file <- file.path(OUT, season_path(s))
       base_local <- if (!is.null(entry$pitches) && entry$pitches %in% hub_list(hub)) hub_download(hub, entry$pitches) else NA
       models_used <- entry$models %||% empty_obj()
       if (length(deltas)) {
@@ -181,7 +200,6 @@ main <- function() {
             if (unscored) models_used[[m$name]] <- "partial"
           }
         }
-        out_file <- file.path(OUT, season_path(s))
         rows <- merge_files(con, cfg, sprintf("season %s", s), c(base_local, delta_local), out_file)  # stops on failed check
         if (is.null(rows)) next
         source_file <- out_file
@@ -189,7 +207,28 @@ main <- function() {
         if (is.na(base_local)) next
         rows <- entry$rows
         source_file <- base_local                    # summaries only; season file unchanged
+        if (due || due_p) { file.copy(base_local, ensure_dir(out_file), overwrite = TRUE); source_file <- out_file }
       }
+      pitches_filled <- 0
+      if (due_p && source_file == out_file) {
+        if (is.null(state$tm_games)) state$tm_games <- empty_obj()
+        state$tm_games <- tryCatch({
+          st <- tm_enrich_pitches(con, cfg, s, source_file, state$tm_games)
+          pitches_filled <- attr(st, "filled") %||% 0
+          attr(st, "filled") <- NULL
+          st
+        }, error = function(e) {
+          errors <<- c(errors, sprintf("TruMedia pitch fill %s failed (data still loaded): %s", s, redact(conditionMessage(e))))
+          state$tm_games })
+      }
+      # Nightly pitch check found no new games and nothing else changed:
+      # don't re-upload an identical season file.
+      if (!length(deltas) && !due && pitches_filled == 0 && source_file == out_file) {
+        unlink(out_file); source_file <- base_local
+        if (!isTRUE(entry$summaries_stale)) { unlink(base_local); next }
+      }
+      if (due) tryCatch(tm_enrich_file(con, cfg, s, source_file), error = function(e)
+        errors <<- c(errors, sprintf("TruMedia fielder fill %s failed (data still loaded): %s", s, redact(conditionMessage(e)))))
       built <- build_season_outputs(con, s, source_file, cfg)
       manifest$trackman[[s]] <- list(pitches = season_path(s), rows = rows, deltas = list(),
                                      models = models_used, summaries_stale = FALSE,
@@ -205,6 +244,31 @@ main <- function() {
       delete_paths <- unique(c(delete_paths, intersect(deltas, hub_list(hub))))
       unlink(file.path(OUT, deltas))
       if (!is.na(base_local)) unlink(base_local)
+    }
+
+    # Other collections (Cape League): no live feed yet, but when the private
+    # scorer re-scores them their summaries need rebuilding too.
+    for (coll in setdiff(names(manifest$collections), "trackman")) {
+      SK <- summary_key(coll)
+      if (!length(manifest[[SK]])) manifest[[SK]] <- empty_obj()
+      for (s in names(manifest[[coll]])) {
+        entry <- manifest[[coll]][[s]]
+        if (!isTRUE(entry$summaries_stale) || is.null(entry$pitches) || !(entry$pitches %in% hub_list(hub))) next
+        local <- hub_download(hub, entry$pitches)
+        built <- tryCatch(build_season_outputs(con, s, local, cfg, coll), error = function(e) {
+          errors <<- c(errors, sprintf("%s %s summaries failed: %s", coll, s, redact(conditionMessage(e)))); NULL })
+        unlink(local)
+        if (is.null(built)) next
+        entry$summaries_stale <- FALSE
+        entry$updated_utc <- now_utc()
+        manifest[[coll]][[s]] <- entry
+        for (nm in names(built$paths)) {
+          cur <- manifest[[SK]][[nm]] %||% empty_obj()
+          cur[[s]] <- built$paths[[nm]]
+          manifest[[SK]][[nm]] <- cur
+        }
+        log_msg("%s %s: summaries rebuilt", coll, s)
+      }
     }
 
     problems <- health_check(cfg, manifest)
