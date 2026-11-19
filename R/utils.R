@@ -193,13 +193,33 @@ duck_connect <- function() {
   dir.create(tmp, recursive = TRUE, showWarnings = FALSE)
   dbExecute(con, sprintf("SET temp_directory = %s", sql_str(tmp)))
   dbExecute(con, "SET preserve_insertion_order = false")
-  # GitHub runners for private repos have ~7 GB RAM. DuckDB's default (80%)
-  # leaves no room for R and big sorts then die with "Out of Memory".
-  # Cap it lower and use fewer threads so sorts spill to the scratch disk.
-  dbExecute(con, sprintf("SET memory_limit = '%s'", Sys.getenv("FIELDHOUSE_DUCK_MEMORY", "3GB")))
-  dbExecute(con, sprintf("SET threads = %d", as.integer(Sys.getenv("FIELDHOUSE_DUCK_THREADS", "2"))))
-  dbExecute(con, "SET max_temp_directory_size = '60GB'")
+  # Runners: private repos ~7 GB RAM / 2 cores, public ~16 GB / 4 cores.
+  # Use ~60% of this machine's RAM (room for R) and spill the rest to the
+  # scratch disk. Env vars override (the history seed uses 1 thread).
+  ram_gb <- tryCatch({
+    l <- grep("^MemTotal", readLines("/proc/meminfo"), value = TRUE)
+    as.numeric(gsub("[^0-9]", "", l)) / 1024^2 }, error = function(e) 7)
+  mem <- Sys.getenv("FIELDHOUSE_DUCK_MEMORY", sprintf("%.1fGB", max(1.5, ram_gb * 0.6)))
+  dbExecute(con, sprintf("SET memory_limit = '%s'", mem))
+  th <- Sys.getenv("FIELDHOUSE_DUCK_THREADS", "")
+  if (nzchar(th)) dbExecute(con, sprintf("SET threads = %d", as.integer(th)))
+  dbExecute(con, "SET max_temp_directory_size = '80GB'")
   con
+}
+
+# COPY a query to Parquet sorted for fast app reads; if the sort runs out of
+# memory, write it unsorted instead (same rows, app queries just a bit slower)
+# rather than failing the whole run.
+copy_sorted <- function(con, select_sql, order_by, out_file, row_group_size) {
+  run <- function(ord) dbExecute(con, sprintf(
+    "COPY (%s %s) TO %s (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE %d)",
+    select_sql, ord, sql_str(out_file), as.integer(row_group_size)))
+  tryCatch(run(paste("ORDER BY", order_by)), error = function(e) {
+    if (!grepl("Out of Memory", conditionMessage(e), ignore.case = TRUE)) stop(e)
+    log_msg("sort ran out of memory for %s; writing unsorted", basename(dirname(out_file)))
+    unlink(out_file)
+    run("")
+  })
 }
 
 # ---- Conferences (team code -> conference), from config/team_conferences.csv

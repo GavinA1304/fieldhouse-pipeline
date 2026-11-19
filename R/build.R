@@ -43,10 +43,8 @@ merge_files <- function(con, cfg, label, files, out_file) {
   first_rows <- dbGetQuery(con, sprintf("SELECT count(*) n FROM read_parquet(%s)", sql_str(files[1])))$n
   ensure_dir(out_file)
   tmp_file <- paste0(out_file, ".tmp")
-  dbExecute(con, sprintf(
-    "COPY (%s ORDER BY PitcherTeam NULLS LAST, Pitcher NULLS LAST, GameDate, PitchNo) TO %s
-     (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE %d)",
-    dedup, sql_str(tmp_file), as.integer(cfg$build$row_group_size)))
+  copy_sorted(con, dedup, "PitcherTeam NULLS LAST, Pitcher NULLS LAST, GameDate, PitchNo",
+              tmp_file, cfg$build$row_group_size)
   new_rows <- dbGetQuery(con, sprintf("SELECT count(*) n FROM read_parquet(%s)", sql_str(tmp_file)))$n
   # Replacing unverified with verified can legitimately drop a few rows, but
   # never a big chunk.
