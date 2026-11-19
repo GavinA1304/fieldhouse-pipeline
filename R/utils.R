@@ -193,6 +193,12 @@ duck_connect <- function() {
   dir.create(tmp, recursive = TRUE, showWarnings = FALSE)
   dbExecute(con, sprintf("SET temp_directory = %s", sql_str(tmp)))
   dbExecute(con, "SET preserve_insertion_order = false")
+  # GitHub runners for private repos have ~7 GB RAM. DuckDB's default (80%)
+  # leaves no room for R and big sorts then die with "Out of Memory".
+  # Cap it lower and use fewer threads so sorts spill to the scratch disk.
+  dbExecute(con, sprintf("SET memory_limit = '%s'", Sys.getenv("FIELDHOUSE_DUCK_MEMORY", "3GB")))
+  dbExecute(con, sprintf("SET threads = %d", as.integer(Sys.getenv("FIELDHOUSE_DUCK_THREADS", "2"))))
+  dbExecute(con, "SET max_temp_directory_size = '60GB'")
   con
 }
 
